@@ -39,5 +39,44 @@ import Footer from '../components/sections/Footer.astro';
         }, 1200);
       });
     }
+
+    const contactForm = document.getElementById('contact-form') as HTMLFormElement | null;
+    const contactStatus = document.getElementById('contact-status');
+    const contactSubmit = document.getElementById('contact-submit') as HTMLButtonElement | null;
+
+    if (contactForm && contactStatus && contactSubmit) {
+      contactForm.addEventListener('submit', async (event) => {
+        event.preventDefault();
+
+        contactSubmit.disabled = true;
+        contactSubmit.textContent = 'Sending...';
+        contactStatus.textContent = 'Submitting your message...';
+        contactStatus.className = 'text-sm text-noir-500';
+
+        try {
+          const response = await fetch('/api/contact', {
+            method: 'POST',
+            body: new FormData(contactForm),
+          });
+
+          const payload = await response.json().catch(() => ({}));
+
+          if (!response.ok) {
+            throw new Error(payload.error || 'Failed to send message.');
+          }
+
+          contactForm.reset();
+          contactStatus.textContent = 'Message sent. You should hear back by email.';
+          contactStatus.className = 'text-sm text-fox';
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Failed to send message.';
+          contactStatus.textContent = message;
+          contactStatus.className = 'text-sm text-noir-400';
+        } finally {
+          contactSubmit.disabled = false;
+          contactSubmit.textContent = 'Send message';
+        }
+      });
+    }
   </script>
 </Base>
