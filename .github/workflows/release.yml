@@ -10,10 +10,56 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  NODE_VERSION: "22.12.0"
 
 jobs:
+  preflight:
+    name: Release Preflight
+    runs-on: ubuntu-latest
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      VSCE_PAT: ${{ secrets.VSCE_PAT }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Verify release secrets
+        run: |
+          missing=0
+          for name in NPM_TOKEN CARGO_REGISTRY_TOKEN VSCE_PAT; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::Missing required release secret: ${name}"
+              missing=1
+            fi
+          done
+          exit "${missing}"
+      - name: Verify tag matches package versions
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          cargo_version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          npm_version=$(node -p "require('./packages/npm/package.json').version")
+          vscode_version=$(node -p "require('./vscode-extension/package.json').version")
+          vscode_lock_version=$(node -p "require('./vscode-extension/package-lock.json').version")
+
+          for entry in \
+            "Cargo.toml:${cargo_version}" \
+            "packages/npm/package.json:${npm_version}" \
+            "vscode-extension/package.json:${vscode_version}" \
+            "vscode-extension/package-lock.json:${vscode_lock_version}"
+          do
+            file="${entry%%:*}"
+            version="${entry#*:}"
+            if [ "${version}" != "${tag_version}" ]; then
+              echo "::error::${file} version ${version} does not match tag ${tag_version}"
+              exit 1
+            fi
+          done
+
   build:
     name: Build ${{ matrix.target }}
+    needs: preflight
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -73,8 +119,8 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
 
-  release:
-    name: Create Release
+  github-release:
+    name: Create GitHub Release
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -98,3 +144,103 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  publish-crates:
+    name: Publish crates.io
+    needs: github-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Publish crate
+        run: |
+          set +e
+          output=$(cargo publish --token "${{ secrets.CARGO_REGISTRY_TOKEN }}" 2>&1)
+          status=$?
+          set -e
+          echo "${output}"
+          if [ "${status}" -ne 0 ]; then
+            crate_name=$(sed -n 's/^name = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+            crate_version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+            published_version=$(python3 - "${crate_name}" <<'PY'
+import json
+import sys
+import urllib.request
+
+name = sys.argv[1]
+url = f"https://crates.io/api/v1/crates/{name}"
+
+try:
+    with urllib.request.urlopen(url, timeout=10) as response:
+        payload = json.load(response)
+    print(payload["crate"]["max_version"])
+except Exception:
+    print("")
+PY
+)
+            if [ "${published_version}" = "${crate_version}" ]; then
+              echo "crates.io already has ${crate_name} ${crate_version}; treating rerun as success"
+              exit 0
+            fi
+            exit "${status}"
+          fi
+
+  publish-npm:
+    name: Publish npm
+    needs: github-release
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/npm
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: "https://registry.npmjs.org"
+      - name: Publish npm package
+        run: |
+          set +e
+          output=$(npm publish --access public 2>&1)
+          status=$?
+          set -e
+          echo "${output}"
+          if [ "${status}" -ne 0 ]; then
+            package_name=$(node -p "require('./package.json').name")
+            package_version=$(node -p "require('./package.json').version")
+            published_version=$(npm view "${package_name}" version 2>/dev/null || true)
+            if [ "${published_version}" = "${package_version}" ]; then
+              echo "npm already has ${package_name} ${package_version}; treating rerun as success"
+              exit 0
+            fi
+            exit "${status}"
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  publish-vscode:
+    name: Publish VS Code Extension
+    needs: github-release
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: vscode-extension
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: vscode-extension/package-lock.json
+      - run: npm ci
+      - run: npm run compile
+      - name: Publish extension
+        run: |
+          set +e
+          output=$(npx @vscode/vsce publish -p "${VSCE_PAT}" 2>&1)
+          status=$?
+          echo "${output}"
+          if [ "${status}" -ne 0 ] && ! echo "${output}" | grep -q "already exists"; then
+            exit "${status}"
+          fi
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
