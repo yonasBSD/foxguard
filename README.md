@@ -7,12 +7,10 @@
 <p align="center">
   <strong>Sub-second local security scanning for real codebases.</strong>
   <br/>
-  100+ built-in rules &middot; 10 languages &middot; single Rust binary &middot; Semgrep-compatible YAML bridge
+  130+ built-in rules &middot; 10 languages &middot; taint tracking for Python, JavaScript, Go &middot; single Rust binary &middot; Semgrep-compatible YAML bridge
   <br/><br/>
   <a href="https://foxguard.dev">foxguard.dev</a> &middot; <a href="https://www.npmjs.com/package/foxguard">npm</a> &middot; <a href="https://crates.io/crates/foxguard">crates.io</a>
 </p>
-
-<p align="center"><strong>A PwnKit Labs product.</strong></p>
 
 <p align="center">
   <a href="https://github.com/PwnKit-Labs/foxguard/actions/workflows/ci.yml"><img src="https://github.com/PwnKit-Labs/foxguard/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
@@ -51,7 +49,10 @@ WARNING 2 issues in 5 files (0.03s): 1 critical, 1 high, 0 medium, 0 low
 
 - **Fast enough to leave on.** foxguard is built for local runs, pre-commit hooks, and changed-file scans instead of “security later in CI”.
 - **Useful before you tune anything.** The default value is built-in framework-aware rules for common real-world mistakes across JavaScript, Python, Go, Ruby, Java, PHP, Rust, C#, and Swift.
+- **Taint tracking built in.** Intraprocedural taint flow from framework sources (Flask, Django, FastAPI, Express, Next.js, Hono, Gin, net/http) into sinks like `eval`, `exec`, SQL execute, and SSRF — no rule writing required.
 - **Adoption-friendly.** If you already have Semgrep/OpenGrep YAML, foxguard can load a focused compatible subset on top of built-ins so migration is incremental instead of all-or-nothing.
+
+See [docs/precision.md](docs/precision.md) for per-rule precision tiers and our false-positive methodology.
 
 ## Quick start
 
@@ -66,7 +67,7 @@ npx foxguard init              # install a local pre-commit hook
 
 Rust + [tree-sitter](https://tree-sitter.github.io/) for AST parsing + [rayon](https://github.com/rayon-rs/rayon) for parallelism. No JVM startup, no Python interpreter, no network calls, no rule download step. Just a native binary that reads your files and reports findings.
 
-100+ built-in rules across 10 languages. SQL injection, XSS, SSRF, command injection, hardcoded secrets, weak crypto, unsafe deserialization, log injection, and framework-specific checks for Express, Django, Rails, Spring, Laravel, Gin, .NET, and iOS.
+130+ built-in rules across 10 languages. SQL injection, XSS, SSRF, command injection, hardcoded secrets, weak crypto, unsafe deserialization, log injection, and framework-specific checks for Express, Django, Rails, Spring, Laravel, Gin, .NET, and iOS. Python, JavaScript, and Go also get an intraprocedural taint engine that follows untrusted input from framework request sources into dangerous sinks.
 
 Also scans for leaked credentials (AWS keys, GitHub/GitLab/Slack/Stripe tokens, private keys) with redacted output. Loads Semgrep-compatible YAML rules with `--rules` if you have existing ones. Outputs terminal, JSON, or SARIF for GitHub Code Scanning.
 
@@ -96,25 +97,26 @@ cargo install foxguard                 # crates.io
 
 ## Benchmarks
 
-Real-world benchmarks on local codebases:
+Reproducible benchmarks via `./benchmarks/run.sh`. Numbers below are from a local run on an Apple Silicon laptop with `foxguard 0.4.0`, `semgrep 1.156.0`, `tokei 14.0.0`. LoC is counted by tokei, scoped to the target language only (no vendored HTML/JSON).
 
-| Repo | Files | foxguard | Semgrep (cached) | Speedup |
-|------|-------|----------|-------------------|---------|
-| youtube-reader (Next.js) | 41 | **0.03s** | 4.6s | **153x** |
-| doruk.ch (Astro) | 28 | **0.04s** | 5.4s | **134x** |
-| SwissPriceScraper (Python) | 17 | **0.01s** | 4.8s | **482x** |
-| express (framework) | 141 | **0.28s** | 17.4s | **61x** |
-| flask (framework) | 83 | **0.08s** | 7.3s | **87x** |
+| Repo | Files | LoC | foxguard | Semgrep | Speedup |
+|------|-------|-----|----------|---------|---------|
+| express (framework) | 141 | 15,804 JS | **0.11s** | 4.80s | **45x** |
+| flask (framework) | 83 | 14,029 Py | **0.08s** | 5.70s | **73x** |
+| gin (framework) | 99 | 17,669 Go | **0.07s** | 4.61s | **63x** |
+| **sentry (production)** | **8,539** | **1,291,606 Py** | **12.19s** | 164.53s | **13x** |
 
-Semgrep times measured with cached rules (second run). foxguard has no cache — it's just fast.
+Sentry is the larger-corpus stress target added under issue #8: a real production monitoring platform at ~1.3M Python LoC. foxguard scans the whole tree in ~12 seconds (~106k LoC/sec); Semgrep with `--config auto` takes ~2m45s on the same tree. Run on one machine — your numbers will vary; reproduce locally with `./benchmarks/run.sh`.
+
+To reproduce: `./benchmarks/run.sh` (add `BENCH_SKIP_LARGE=1` for the quick matrix only). See `benchmarks/README.md` for the reproduction recipe.
 
 ## Built-in coverage
 
 | Language | Rules | Frameworks |
 |----------|-------|------------|
-| JavaScript/TypeScript | 25 | Express, JWT, cookies, XSS, log injection |
-| Python | 26 | Flask, Django, CSRF, session |
-| Go | 8 | Gin, net/http, TLS |
+| JavaScript/TypeScript | 27 | Express, Next.js, Hono, Fastify, SvelteKit, Deno, JWT, XSS, taint |
+| Python | 32 | Flask, Django, FastAPI, CSRF, session, intraprocedural taint |
+| Go | 11 | Gin, net/http, TLS, intraprocedural taint |
 | Ruby | 10 | Rails, mass assignment, CSRF |
 | Java | 10 | Spring, XXE, deserialization |
 | PHP | 10 | Laravel, file inclusion, unserialize |
@@ -150,7 +152,7 @@ jobs:
       security-events: write
     steps:
       - uses: actions/checkout@v4
-      - uses: PwnKit-Labs/foxguard/action@v0.3.2
+      - uses: PwnKit-Labs/foxguard/action@v0.4.0
         with:
           path: .
           severity: medium
@@ -179,7 +181,7 @@ npx foxguard@latest secrets .                      # secrets
 ```yaml
 repos:
   - repo: https://github.com/PwnKit-Labs/foxguard
-    rev: v0.3.2
+    rev: v0.4.0
     hooks:
       - id: foxguard
       - id: foxguard-secrets
@@ -205,17 +207,37 @@ secrets:
     - secret/github-token
 ```
 
+## Suppressing Deliberate Findings
+
+For one-off, deliberate code patterns, you can suppress code-scan findings inline instead of
+adding them to a baseline.
+
+```js
+// Ignore the next code line for one rule
+// foxguard: ignore[js/no-ssrf]
+fileContent = fetch(userControlledUrl);
+
+// Ignore the current line for one rule
+fileContent = fetch(userControlledUrl); // foxguard: ignore[js/no-ssrf]
+
+// Ignore the current line for all foxguard code findings
+eval(userInput); // foxguard: ignore
+```
+
+Notes:
+
+- Inline ignores currently apply to code scanning findings, not `foxguard secrets`.
+- Rule IDs must match exactly, for example `js/no-ssrf`.
+- Comment-only directives apply to the next non-empty, non-comment code line.
+- Supported comment styles are `//` and `#`, depending on the language.
+
 ## Contributing
 
 Adding a rule is one struct implementing a trait. See [`CONTRIBUTING.md`](./CONTRIBUTING.md).
 
----
+## Part of PwnKit Labs
 
-*Built by [PwnKit Labs](https://github.com/PwnKit-Labs) and [Doruk Tan Ozturk](https://doruk.ch)*
-
-## Part of the open-source modern SOC
-
-foxguard is one piece of a three-part open-source security stack:
+**Open-source adversarial security for the agentic AI era.** foxguard is one piece of the open-source PwnKit Labs stack:
 - **[pwnkit](https://github.com/PwnKit-Labs/pwnkit)** — AI agent pentester (detect)
 - **[foxguard](https://github.com/PwnKit-Labs/foxguard)** — Rust security scanner (prevent)
 - **[opensoar](https://github.com/opensoar-hq/opensoar-core)** — Python-native SOAR platform (respond)

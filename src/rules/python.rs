@@ -1,50 +1,20 @@
-use crate::rules::Rule;
+use crate::rules::common::{get_source_line, make_finding, walk_tree};
+use crate::rules::{FileContext, Rule};
 use crate::{Finding, Language, Severity};
 use regex::Regex;
+use std::borrow::Cow;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-fn get_source_line(source: &str, byte_offset: usize) -> String {
-    let start = source[..byte_offset].rfind('\n').map_or(0, |p| p + 1);
-    let end = source[byte_offset..]
-        .find('\n')
-        .map_or(source.len(), |p| byte_offset + p);
-    source[start..end].to_string()
-}
-
-fn walk_tree(
-    node: tree_sitter::Node,
-    source: &str,
-    callback: &mut dyn FnMut(tree_sitter::Node, &str),
-) {
-    callback(node, source);
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        walk_tree(child, source, callback);
-    }
-}
-
-fn make_finding(
-    rule_id: &str,
-    severity: Severity,
-    cwe: Option<&str>,
-    description: &str,
-    node: tree_sitter::Node,
-    source: &str,
-) -> Finding {
-    let start = node.start_position();
-    let end = node.end_position();
-    Finding {
-        rule_id: rule_id.to_string(),
-        severity,
-        cwe: cwe.map(|s| s.to_string()),
-        description: description.to_string(),
-        file: String::new(),
-        line: start.row + 1,
-        column: start.column + 1,
-        end_line: end.row + 1,
-        end_column: end.column + 1,
-        snippet: get_source_line(source, node.start_byte()),
+/// Resolve a raw callee text through the per-file Python import alias table.
+/// Returns the canonical dotted path when an alias matches, otherwise the
+/// input unchanged. Falls back to the raw text when no alias table is
+/// available (e.g. under the legacy `check` entry point used by some unit
+/// tests).
+fn resolve_callee<'a>(func_text: &'a str, ctx: &'a FileContext<'_>) -> Cow<'a, str> {
+    match ctx.python_aliases {
+        Some(aliases) => aliases.resolve(func_text),
+        None => Cow::Borrowed(func_text),
     }
 }
 
@@ -70,20 +40,30 @@ impl Rule for NoEval {
     }
 
     fn check(&self, source: &str, tree: &tree_sitter::Tree) -> Vec<Finding> {
+        self.check_with_context(source, tree, &FileContext::default())
+    }
+
+    fn check_with_context(
+        &self,
+        source: &str,
+        tree: &tree_sitter::Tree,
+        ctx: &FileContext<'_>,
+    ) -> Vec<Finding> {
         let mut findings = Vec::new();
 
         walk_tree(tree.root_node(), source, &mut |node, src| {
             if node.kind() == "call" {
                 if let Some(func) = node.child_by_field_name("function") {
                     let func_text = &src[func.byte_range()];
-                    if func_text == "eval" || func_text == "exec" {
+                    let resolved = resolve_callee(func_text, ctx);
+                    if resolved.as_ref() == "eval" || resolved.as_ref() == "exec" {
                         findings.push(make_finding(
                             self.id(),
                             self.severity(),
                             self.cwe(),
                             &format!(
                                 "{}() allows arbitrary code execution — avoid using it with untrusted input",
-                                func_text
+                                resolved
                             ),
                             node,
                             src,
@@ -304,6 +284,15 @@ impl Rule for NoCommandInjection {
     }
 
     fn check(&self, source: &str, tree: &tree_sitter::Tree) -> Vec<Finding> {
+        self.check_with_context(source, tree, &FileContext::default())
+    }
+
+    fn check_with_context(
+        &self,
+        source: &str,
+        tree: &tree_sitter::Tree,
+        ctx: &FileContext<'_>,
+    ) -> Vec<Finding> {
         let mut findings = Vec::new();
         let dangerous_fns = [
             "os.system",
@@ -319,7 +308,8 @@ impl Rule for NoCommandInjection {
             if node.kind() == "call" {
                 if let Some(func) = node.child_by_field_name("function") {
                     let func_text = &src[func.byte_range()];
-                    if dangerous_fns.contains(&func_text) {
+                    let resolved = resolve_callee(func_text, ctx);
+                    if dangerous_fns.contains(&resolved.as_ref()) {
                         if let Some(args) = node.child_by_field_name("arguments") {
                             if let Some(first_arg) = args.named_child(0) {
                                 // Flag if argument is not a plain string literal
@@ -341,7 +331,7 @@ impl Rule for NoCommandInjection {
                                         self.cwe(),
                                         &format!(
                                             "{}() called with dynamic argument — risk of command injection",
-                                            func_text
+                                            resolved
                                         ),
                                         node,
                                         src,
@@ -379,14 +369,24 @@ impl Rule for NoPathTraversal {
     }
 
     fn check(&self, source: &str, tree: &tree_sitter::Tree) -> Vec<Finding> {
+        self.check_with_context(source, tree, &FileContext::default())
+    }
+
+    fn check_with_context(
+        &self,
+        source: &str,
+        tree: &tree_sitter::Tree,
+        ctx: &FileContext<'_>,
+    ) -> Vec<Finding> {
         let mut findings = Vec::new();
 
         walk_tree(tree.root_node(), source, &mut |node, src| {
             if node.kind() == "call" {
                 if let Some(func) = node.child_by_field_name("function") {
                     let func_text = &src[func.byte_range()];
+                    let resolved = resolve_callee(func_text, ctx);
                     let sink_fns = ["open", "os.remove", "os.unlink", "os.listdir", "os.scandir"];
-                    if sink_fns.contains(&func_text) {
+                    if sink_fns.contains(&resolved.as_ref()) {
                         if let Some(args) = node.child_by_field_name("arguments") {
                             if let Some(first_arg) = args.named_child(0) {
                                 // Flag if path uses concatenation or f-string
@@ -407,7 +407,7 @@ impl Rule for NoPathTraversal {
                                         self.cwe(),
                                         &format!(
                                             "{}() called with dynamic path — validate and sanitize to prevent path traversal",
-                                            func_text
+                                            resolved
                                         ),
                                         node,
                                         src,
@@ -445,6 +445,15 @@ impl Rule for NoSsrf {
     }
 
     fn check(&self, source: &str, tree: &tree_sitter::Tree) -> Vec<Finding> {
+        self.check_with_context(source, tree, &FileContext::default())
+    }
+
+    fn check_with_context(
+        &self,
+        source: &str,
+        tree: &tree_sitter::Tree,
+        ctx: &FileContext<'_>,
+    ) -> Vec<Finding> {
         let mut findings = Vec::new();
         let request_fns = [
             "requests.get",
@@ -471,7 +480,8 @@ impl Rule for NoSsrf {
                 return;
             };
             let func_text = &src[func.byte_range()];
-            if !request_fns.contains(&func_text) {
+            let resolved = resolve_callee(func_text, ctx);
+            if !request_fns.contains(&resolved.as_ref()) {
                 return;
             }
 
@@ -479,7 +489,9 @@ impl Rule for NoSsrf {
                 return;
             };
 
-            let url_arg = if func_text == "requests.request" || func_text == "httpx.request" {
+            let url_arg = if resolved.as_ref() == "requests.request"
+                || resolved.as_ref() == "httpx.request"
+            {
                 args.named_child(1)
             } else {
                 args.named_child(0)
@@ -504,7 +516,7 @@ impl Rule for NoSsrf {
                     self.cwe(),
                     &format!(
                         "{} called with dynamic URL — validate and allowlist outbound destinations to prevent SSRF",
-                        func_text
+                        resolved
                     ),
                     node,
                     src,
@@ -538,14 +550,24 @@ impl Rule for NoWeakCrypto {
     }
 
     fn check(&self, source: &str, tree: &tree_sitter::Tree) -> Vec<Finding> {
+        self.check_with_context(source, tree, &FileContext::default())
+    }
+
+    fn check_with_context(
+        &self,
+        source: &str,
+        tree: &tree_sitter::Tree,
+        ctx: &FileContext<'_>,
+    ) -> Vec<Finding> {
         let mut findings = Vec::new();
 
         walk_tree(tree.root_node(), source, &mut |node, src| {
             if node.kind() == "call" {
                 if let Some(func) = node.child_by_field_name("function") {
                     let func_text = &src[func.byte_range()];
-                    if func_text == "hashlib.md5" || func_text == "hashlib.sha1" {
-                        let algo = if func_text.contains("md5") {
+                    let resolved = resolve_callee(func_text, ctx);
+                    if resolved.as_ref() == "hashlib.md5" || resolved.as_ref() == "hashlib.sha1" {
+                        let algo = if resolved.as_ref().contains("md5") {
                             "MD5"
                         } else {
                             "SHA1"
@@ -564,7 +586,7 @@ impl Rule for NoWeakCrypto {
                     }
 
                     // hashlib.new('md5') / hashlib.new('sha1')
-                    if func_text == "hashlib.new" {
+                    if resolved.as_ref() == "hashlib.new" {
                         if let Some(args) = node.child_by_field_name("arguments") {
                             if let Some(first_arg) = args.named_child(0) {
                                 if first_arg.kind() == "string" {
@@ -616,6 +638,15 @@ impl Rule for NoPickle {
     }
 
     fn check(&self, source: &str, tree: &tree_sitter::Tree) -> Vec<Finding> {
+        self.check_with_context(source, tree, &FileContext::default())
+    }
+
+    fn check_with_context(
+        &self,
+        source: &str,
+        tree: &tree_sitter::Tree,
+        ctx: &FileContext<'_>,
+    ) -> Vec<Finding> {
         let mut findings = Vec::new();
         let dangerous_fns = [
             "pickle.loads",
@@ -628,14 +659,15 @@ impl Rule for NoPickle {
             if node.kind() == "call" {
                 if let Some(func) = node.child_by_field_name("function") {
                     let func_text = &src[func.byte_range()];
-                    if dangerous_fns.contains(&func_text) {
+                    let resolved = resolve_callee(func_text, ctx);
+                    if dangerous_fns.contains(&resolved.as_ref()) {
                         findings.push(make_finding(
                             self.id(),
                             self.severity(),
                             self.cwe(),
                             &format!(
                                 "{}() deserializes untrusted data — can execute arbitrary code",
-                                func_text
+                                resolved
                             ),
                             node,
                             src,
@@ -670,13 +702,23 @@ impl Rule for NoYamlLoad {
     }
 
     fn check(&self, source: &str, tree: &tree_sitter::Tree) -> Vec<Finding> {
+        self.check_with_context(source, tree, &FileContext::default())
+    }
+
+    fn check_with_context(
+        &self,
+        source: &str,
+        tree: &tree_sitter::Tree,
+        ctx: &FileContext<'_>,
+    ) -> Vec<Finding> {
         let mut findings = Vec::new();
 
         walk_tree(tree.root_node(), source, &mut |node, src| {
             if node.kind() == "call" {
                 if let Some(func) = node.child_by_field_name("function") {
                     let func_text = &src[func.byte_range()];
-                    if func_text == "yaml.load" {
+                    let resolved = resolve_callee(func_text, ctx);
+                    if resolved.as_ref() == "yaml.load" {
                         // Check if SafeLoader or safe_load is used
                         if let Some(args) = node.child_by_field_name("arguments") {
                             let args_text = &src[args.byte_range()];
@@ -1716,5 +1758,450 @@ impl Rule for SecureSslRedirectDisabled {
         });
 
         findings
+    }
+}
+
+// ─── Rule: taint-pickle-deserialization ────────────────────────────────────
+//
+// Proof-of-concept rule exercising the new per-function taint engine.
+// Fires when Flask-style untrusted input reaches a pickle deserialization
+// sink within a single function body. Coexists with `py/no-pickle`:
+//
+//   - `py/no-pickle` is the conservative direct-sink rule. It fires on any
+//     call to `pickle.loads(...)` regardless of what the argument is.
+//   - `py/taint-pickle-deserialization` fires only when the argument is
+//     provably reachable from a known untrusted source within the same
+//     function. Higher precision, lower recall.
+//
+// Scope and limitations are documented in `docs/taint-tracking.md` and in
+// the doc comment on `python_taint`. Intraprocedural only, flow-insensitive,
+// no sanitizers yet.
+
+use crate::rules::python_taint::{self, python_taint_sources, NodeMatcher, TaintSpec};
+
+/// Convenience: build a `Call` sink matcher where the canonical path and
+/// the finding description are the same string. Used by every taint rule
+/// below to keep spec definitions short.
+fn call_sink(canonical: &str) -> NodeMatcher {
+    NodeMatcher::Call {
+        canonical: canonical.into(),
+        description: canonical.into(),
+    }
+}
+
+/// Shared mapper from engine-level `TaintFinding` to the public `Finding`
+/// shape, parameterized by the rule's metadata and a description template
+/// that receives the source and sink descriptions.
+#[allow(clippy::too_many_arguments)]
+fn map_taint_findings(
+    rule_id: &str,
+    severity: Severity,
+    cwe: Option<&str>,
+    source: &str,
+    tree: &tree_sitter::Tree,
+    ctx: &FileContext<'_>,
+    spec: &TaintSpec,
+    format_description: impl Fn(&str, &str) -> String,
+) -> Vec<Finding> {
+    let raw = python_taint::analyze_tree(tree.root_node(), source, spec, ctx.python_aliases);
+    raw.into_iter()
+        .map(|t| Finding {
+            rule_id: rule_id.to_string(),
+            severity,
+            cwe: cwe.map(|s| s.to_string()),
+            description: format_description(&t.source_description, &t.sink_description),
+            file: String::new(),
+            line: t.sink_line,
+            column: t.sink_column,
+            end_line: t.sink_end_line,
+            end_column: t.sink_end_column,
+            snippet: get_source_line(source, t.sink_start_byte),
+        })
+        .collect()
+}
+
+pub struct TaintPickleDeserialization;
+
+impl TaintPickleDeserialization {
+    fn spec() -> TaintSpec {
+        TaintSpec {
+            sources: python_taint_sources(),
+            sinks: vec![
+                call_sink("pickle.loads"),
+                call_sink("pickle.load"),
+                call_sink("cPickle.loads"),
+                call_sink("cPickle.load"),
+            ],
+            sanitizers: vec![],
+        }
+    }
+}
+
+impl Rule for TaintPickleDeserialization {
+    fn id(&self) -> &str {
+        "py/taint-pickle-deserialization"
+    }
+    fn severity(&self) -> Severity {
+        Severity::Critical
+    }
+    fn cwe(&self) -> Option<&str> {
+        Some("CWE-502")
+    }
+    fn description(&self) -> &str {
+        "Untrusted input reaches pickle deserialization sink"
+    }
+    fn language(&self) -> Language {
+        Language::Python
+    }
+
+    fn check(&self, source: &str, tree: &tree_sitter::Tree) -> Vec<Finding> {
+        self.check_with_context(source, tree, &FileContext::default())
+    }
+
+    fn check_with_context(
+        &self,
+        source: &str,
+        tree: &tree_sitter::Tree,
+        ctx: &FileContext<'_>,
+    ) -> Vec<Finding> {
+        map_taint_findings(
+            self.id(),
+            self.severity(),
+            self.cwe(),
+            source,
+            tree,
+            ctx,
+            &Self::spec(),
+            |src, sink| {
+                format!(
+                    "{} reaches {} — untrusted input can execute arbitrary code via pickle",
+                    src, sink
+                )
+            },
+        )
+    }
+}
+
+// ─── py/taint-eval ────────────────────────────────────────────────────────
+pub struct TaintEvalFromRequest;
+
+impl TaintEvalFromRequest {
+    fn spec() -> TaintSpec {
+        TaintSpec {
+            sources: python_taint_sources(),
+            sinks: vec![call_sink("eval"), call_sink("exec")],
+            sanitizers: vec![],
+        }
+    }
+}
+
+impl Rule for TaintEvalFromRequest {
+    fn id(&self) -> &str {
+        "py/taint-eval"
+    }
+    fn severity(&self) -> Severity {
+        Severity::Critical
+    }
+    fn cwe(&self) -> Option<&str> {
+        Some("CWE-95")
+    }
+    fn description(&self) -> &str {
+        "Untrusted input reaches eval/exec sink"
+    }
+    fn language(&self) -> Language {
+        Language::Python
+    }
+
+    fn check(&self, source: &str, tree: &tree_sitter::Tree) -> Vec<Finding> {
+        self.check_with_context(source, tree, &FileContext::default())
+    }
+
+    fn check_with_context(
+        &self,
+        source: &str,
+        tree: &tree_sitter::Tree,
+        ctx: &FileContext<'_>,
+    ) -> Vec<Finding> {
+        map_taint_findings(
+            self.id(),
+            self.severity(),
+            self.cwe(),
+            source,
+            tree,
+            ctx,
+            &Self::spec(),
+            |src, sink| {
+                format!(
+                    "{} reaches {} — untrusted input can execute arbitrary Python code",
+                    src, sink
+                )
+            },
+        )
+    }
+}
+
+// ─── py/taint-command-injection ──────────────────────────────────────────
+pub struct TaintCommandInjectionFromRequest;
+
+impl TaintCommandInjectionFromRequest {
+    fn spec() -> TaintSpec {
+        TaintSpec {
+            sources: python_taint_sources(),
+            sinks: vec![
+                call_sink("os.system"),
+                call_sink("os.popen"),
+                call_sink("subprocess.run"),
+                call_sink("subprocess.Popen"),
+                call_sink("subprocess.call"),
+                call_sink("subprocess.check_call"),
+                call_sink("subprocess.check_output"),
+            ],
+            sanitizers: vec![],
+        }
+    }
+}
+
+impl Rule for TaintCommandInjectionFromRequest {
+    fn id(&self) -> &str {
+        "py/taint-command-injection"
+    }
+    fn severity(&self) -> Severity {
+        Severity::Critical
+    }
+    fn cwe(&self) -> Option<&str> {
+        Some("CWE-78")
+    }
+    fn description(&self) -> &str {
+        "Untrusted input reaches OS command execution sink"
+    }
+    fn language(&self) -> Language {
+        Language::Python
+    }
+
+    fn check(&self, source: &str, tree: &tree_sitter::Tree) -> Vec<Finding> {
+        self.check_with_context(source, tree, &FileContext::default())
+    }
+
+    fn check_with_context(
+        &self,
+        source: &str,
+        tree: &tree_sitter::Tree,
+        ctx: &FileContext<'_>,
+    ) -> Vec<Finding> {
+        map_taint_findings(
+            self.id(),
+            self.severity(),
+            self.cwe(),
+            source,
+            tree,
+            ctx,
+            &Self::spec(),
+            |src, sink| {
+                format!(
+                    "{} reaches {} — untrusted input can inject OS commands",
+                    src, sink
+                )
+            },
+        )
+    }
+}
+
+// ─── py/taint-ssrf ────────────────────────────────────────────────────────
+pub struct TaintSsrfFromRequest;
+
+impl TaintSsrfFromRequest {
+    fn spec() -> TaintSpec {
+        TaintSpec {
+            sources: python_taint_sources(),
+            sinks: vec![
+                call_sink("urllib.request.urlopen"),
+                call_sink("requests.get"),
+                call_sink("requests.post"),
+                call_sink("requests.put"),
+                call_sink("requests.delete"),
+                call_sink("requests.request"),
+                call_sink("httpx.get"),
+                call_sink("httpx.post"),
+            ],
+            sanitizers: vec![],
+        }
+    }
+}
+
+impl Rule for TaintSsrfFromRequest {
+    fn id(&self) -> &str {
+        "py/taint-ssrf"
+    }
+    fn severity(&self) -> Severity {
+        Severity::High
+    }
+    fn cwe(&self) -> Option<&str> {
+        Some("CWE-918")
+    }
+    fn description(&self) -> &str {
+        "Untrusted input reaches outbound HTTP sink (potential SSRF)"
+    }
+    fn language(&self) -> Language {
+        Language::Python
+    }
+
+    fn check(&self, source: &str, tree: &tree_sitter::Tree) -> Vec<Finding> {
+        self.check_with_context(source, tree, &FileContext::default())
+    }
+
+    fn check_with_context(
+        &self,
+        source: &str,
+        tree: &tree_sitter::Tree,
+        ctx: &FileContext<'_>,
+    ) -> Vec<Finding> {
+        map_taint_findings(
+            self.id(),
+            self.severity(),
+            self.cwe(),
+            source,
+            tree,
+            ctx,
+            &Self::spec(),
+            |src, sink| {
+                format!(
+                    "{} reaches {} — untrusted input can drive server-side request forgery",
+                    src, sink
+                )
+            },
+        )
+    }
+}
+
+// ─── py/taint-yaml-load ──────────────────────────────────────────────────
+pub struct TaintYamlLoadFromRequest;
+
+impl TaintYamlLoadFromRequest {
+    fn spec() -> TaintSpec {
+        TaintSpec {
+            sources: python_taint_sources(),
+            sinks: vec![
+                call_sink("yaml.load"),
+                call_sink("yaml.unsafe_load"),
+                call_sink("yaml.full_load"),
+            ],
+            sanitizers: vec![],
+        }
+    }
+}
+
+impl Rule for TaintYamlLoadFromRequest {
+    fn id(&self) -> &str {
+        "py/taint-yaml-load"
+    }
+    fn severity(&self) -> Severity {
+        Severity::Critical
+    }
+    fn cwe(&self) -> Option<&str> {
+        Some("CWE-502")
+    }
+    fn description(&self) -> &str {
+        "Untrusted input reaches unsafe YAML loader"
+    }
+    fn language(&self) -> Language {
+        Language::Python
+    }
+
+    fn check(&self, source: &str, tree: &tree_sitter::Tree) -> Vec<Finding> {
+        self.check_with_context(source, tree, &FileContext::default())
+    }
+
+    fn check_with_context(
+        &self,
+        source: &str,
+        tree: &tree_sitter::Tree,
+        ctx: &FileContext<'_>,
+    ) -> Vec<Finding> {
+        map_taint_findings(
+            self.id(),
+            self.severity(),
+            self.cwe(),
+            source,
+            tree,
+            ctx,
+            &Self::spec(),
+            |src, sink| {
+                format!(
+                    "{} reaches {} — untrusted input can execute arbitrary code via YAML deserialization",
+                    src, sink
+                )
+            },
+        )
+    }
+}
+
+// ─── py/taint-sql-injection ──────────────────────────────────────────────
+pub struct TaintSqlInjectionFromRequest;
+
+impl TaintSqlInjectionFromRequest {
+    fn spec() -> TaintSpec {
+        TaintSpec {
+            sources: python_taint_sources(),
+            // DB execute APIs can live on any object (`cursor`, `conn`,
+            // `db`, `session`…). Rather than enumerate every plausible
+            // receiver name, match the final method name via `MethodName`.
+            // This intentionally over-approximates — any `.execute(...)`
+            // called with tainted input is flagged.
+            sinks: vec![
+                NodeMatcher::MethodName {
+                    method: "execute".into(),
+                    description: "cursor/connection.execute".into(),
+                },
+                NodeMatcher::MethodName {
+                    method: "executemany".into(),
+                    description: "cursor/connection.executemany".into(),
+                },
+                NodeMatcher::MethodName {
+                    method: "executescript".into(),
+                    description: "sqlite3.Cursor.executescript".into(),
+                },
+            ],
+            sanitizers: vec![],
+        }
+    }
+}
+
+impl Rule for TaintSqlInjectionFromRequest {
+    fn id(&self) -> &str {
+        "py/taint-sql-injection"
+    }
+    fn severity(&self) -> Severity {
+        Severity::Critical
+    }
+    fn cwe(&self) -> Option<&str> {
+        Some("CWE-89")
+    }
+    fn description(&self) -> &str {
+        "Untrusted input reaches DB execute sink"
+    }
+    fn language(&self) -> Language {
+        Language::Python
+    }
+
+    fn check(&self, source: &str, tree: &tree_sitter::Tree) -> Vec<Finding> {
+        self.check_with_context(source, tree, &FileContext::default())
+    }
+
+    fn check_with_context(
+        &self,
+        source: &str,
+        tree: &tree_sitter::Tree,
+        ctx: &FileContext<'_>,
+    ) -> Vec<Finding> {
+        map_taint_findings(
+            self.id(),
+            self.severity(),
+            self.cwe(),
+            source,
+            tree,
+            ctx,
+            &Self::spec(),
+            |src, sink| format!("{} reaches {} — untrusted input can inject SQL", src, sink),
+        )
     }
 }

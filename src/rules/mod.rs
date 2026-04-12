@@ -1,16 +1,37 @@
+pub mod common;
 pub mod csharp;
 pub mod go;
+pub mod go_taint;
 pub mod java;
 pub mod javascript;
+pub mod javascript_taint;
 pub mod php;
 pub mod python;
+pub mod python_aliases;
+pub mod python_taint;
 pub mod ruby;
 pub mod rust_lang;
 pub mod semgrep_compat;
+pub mod semgrep_taint;
 pub mod swift;
 
 use crate::{Finding, Language, Severity};
 use std::path::Path;
+
+/// Per-file analysis context shared across all rules running on a single file.
+///
+/// Computed once after parsing in the scanner and handed to each rule via
+/// `check_with_context`. Rules that need nothing from it can continue to
+/// implement `check` directly and rely on the default trait method.
+#[derive(Default)]
+pub struct FileContext<'a> {
+    /// Python import alias table. `None` for non-Python files.
+    pub python_aliases: Option<&'a python_aliases::ImportAliases>,
+    /// JavaScript/TypeScript import alias table. `None` for non-JS files.
+    pub javascript_aliases: Option<&'a javascript_taint::JsImportAliases>,
+    /// Go import alias table. `None` for non-Go files.
+    pub go_aliases: Option<&'a go_taint::GoImportAliases>,
+}
 
 /// A security rule that checks parsed source code for vulnerabilities.
 pub trait Rule: Send + Sync {
@@ -23,6 +44,18 @@ pub trait Rule: Send + Sync {
         true
     }
     fn check(&self, source: &str, tree: &tree_sitter::Tree) -> Vec<Finding>;
+
+    /// Context-aware variant. Defaults to calling `check` so every existing
+    /// rule works unchanged. Rules that need the per-file context (e.g.
+    /// Python import aliases) override this instead of `check`.
+    fn check_with_context(
+        &self,
+        source: &str,
+        tree: &tree_sitter::Tree,
+        _ctx: &FileContext<'_>,
+    ) -> Vec<Finding> {
+        self.check(source, tree)
+    }
 }
 
 /// Registry holding all available rules.
@@ -71,6 +104,8 @@ impl RuleRegistry {
         registry.register(Box::new(javascript::JwtDecodeWithoutVerify));
         registry.register(Box::new(javascript::JwtVerifyMissingAlgorithms));
         registry.register(Box::new(javascript::NoUnsafeFormatString));
+        registry.register(Box::new(javascript::TaintXssInnerHtml));
+        registry.register(Box::new(javascript::TaintSqlInjection));
 
         // Register Python rules
         registry.register(Box::new(python::NoEval));
@@ -99,6 +134,12 @@ impl RuleRegistry {
         registry.register(Box::new(python::WtfCsrfCheckDefaultDisabled));
         registry.register(Box::new(python::DjangoAllowedHostsWildcard));
         registry.register(Box::new(python::SecureSslRedirectDisabled));
+        registry.register(Box::new(python::TaintPickleDeserialization));
+        registry.register(Box::new(python::TaintEvalFromRequest));
+        registry.register(Box::new(python::TaintCommandInjectionFromRequest));
+        registry.register(Box::new(python::TaintSsrfFromRequest));
+        registry.register(Box::new(python::TaintYamlLoadFromRequest));
+        registry.register(Box::new(python::TaintSqlInjectionFromRequest));
 
         // Register Go rules
         registry.register(Box::new(go::NoSqlInjection));
@@ -109,6 +150,9 @@ impl RuleRegistry {
         registry.register(Box::new(go::InsecureTlsSkipVerify));
         registry.register(Box::new(go::GinNoTrustedProxies));
         registry.register(Box::new(go::NetHttpNoTimeout));
+        registry.register(Box::new(go::TaintCommandInjection));
+        registry.register(Box::new(go::TaintSqlInjection));
+        registry.register(Box::new(go::TaintSsrf));
 
         // Register Java rules
         registry.register(Box::new(java::NoSqlInjection));

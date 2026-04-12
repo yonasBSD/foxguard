@@ -163,10 +163,14 @@ fn test_vulnerable_py_finds_all_rules() {
     let findings: Vec<serde_json::Value> =
         serde_json::from_slice(&output.stdout).expect("invalid JSON output");
 
+    // Count grew to 31 when `input()` became a taint source (issues
+    // #29/#30): `dangerous()` now additionally fires py/taint-eval on
+    // `eval(input("Enter code: "))` alongside the conservative
+    // py/no-eval finding.
     assert_eq!(
         findings.len(),
-        30,
-        "vulnerable.py should have 30 findings, got {}",
+        31,
+        "vulnerable.py should have 31 findings, got {}",
         findings.len()
     );
 
@@ -207,6 +211,618 @@ fn test_vulnerable_py_finds_all_rules() {
     for rule in &expected_rules {
         assert!(rule_ids.contains(rule), "missing expected rule: {}", rule);
     }
+}
+
+/// Regression test for issue #7: Python rules used to string-match callee
+/// text against a fixed sink list, so `import pickle as p; p.loads(x)` and
+/// every other aliased form slipped past. With the per-file import alias
+/// table, each call site should resolve back to its canonical dotted path
+/// and fire.
+#[test]
+fn test_vulnerable_py_aliases_catches_all_bypass_forms() {
+    let output = foxguard_cmd()
+        .args(["tests/fixtures/vulnerable_py_aliases.py", "-f", "json"])
+        .output()
+        .expect("failed to execute foxguard");
+
+    assert!(!output.status.success());
+
+    let findings: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).expect("invalid JSON output");
+
+    assert_eq!(
+        findings.len(),
+        18,
+        "vulnerable_py_aliases.py should have 18 findings, got {}",
+        findings.len()
+    );
+
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for f in &findings {
+        if let Some(rule) = f["rule_id"].as_str() {
+            *counts.entry(rule).or_insert(0) += 1;
+        }
+    }
+
+    // One row per rule that should be exercised by the aliased fixture,
+    // with the exact number of bypass forms we expect it to catch.
+    let expected: &[(&str, usize)] = &[
+        ("py/no-pickle", 4),
+        ("py/no-yaml-load", 2),
+        ("py/no-weak-crypto", 4),
+        ("py/no-ssrf", 2),
+        ("py/no-command-injection", 4),
+        ("py/no-path-traversal", 2),
+    ];
+
+    for (rule, want) in expected {
+        let got = counts.get(rule).copied().unwrap_or(0);
+        assert_eq!(
+            got, *want,
+            "rule {} caught {} bypass forms, expected {}",
+            rule, got, want
+        );
+    }
+}
+
+/// POC for issue #10 intraprocedural taint tracking. Every function in
+/// `vulnerable_py_taint.py` shows a different shape of untrusted Flask
+/// input reaching `pickle.loads`. The taint rule must catch each flow,
+/// and the existing conservative `py/no-pickle` rule must keep firing
+/// alongside it (the two rules coexist by design).
+#[test]
+fn test_vulnerable_py_taint_catches_every_flow() {
+    let output = foxguard_cmd()
+        .args(["tests/fixtures/vulnerable_py_taint.py", "-f", "json"])
+        .output()
+        .expect("failed to execute foxguard");
+
+    assert!(!output.status.success());
+
+    let findings: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).expect("invalid JSON output");
+
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for f in &findings {
+        if let Some(rule) = f["rule_id"].as_str() {
+            *counts.entry(rule).or_insert(0) += 1;
+        }
+    }
+
+    // Sixteen pickle handlers (10 original + 4 added by #15 for nested
+    // subscripts and tuple/list destructuring + 2 added by #19 for
+    // same-file interprocedural return propagation). Each has one flow:
+    // one py/taint-pickle-deserialization finding per handler. The
+    // conservative py/no-pickle rule coexists on the same sixteen calls.
+    assert_eq!(
+        counts.get("py/taint-pickle-deserialization").copied(),
+        Some(16),
+        "pickle taint rule should fire sixteen times. counts={:?}",
+        counts
+    );
+    assert_eq!(
+        counts.get("py/no-pickle").copied(),
+        Some(16),
+        "NoPickle should still fire sixteen times alongside the taint rule. counts={:?}",
+        counts
+    );
+
+    // Each py/taint-* rule has one or more dedicated positive handlers
+    // and must fire the expected number of times. Its conservative
+    // py/no-* counterpart must coexist and keep firing on the same call.
+    // Counts bumped by issues #27/#28: command-injection and eval each
+    // gain a `request.args.get("...")` handler; sql-injection gains an
+    // f-string handler.
+    for (taint_rule, conservative_rule, expected) in [
+        ("py/taint-eval", "py/no-eval", 2usize),
+        ("py/taint-command-injection", "py/no-command-injection", 2),
+        ("py/taint-ssrf", "py/no-ssrf", 1),
+        ("py/taint-yaml-load", "py/no-yaml-load", 1),
+        ("py/taint-sql-injection", "py/no-sql-injection", 2),
+    ] {
+        assert_eq!(
+            counts.get(taint_rule).copied(),
+            Some(expected),
+            "{} should fire exactly {} time(s) on vulnerable_py_taint.py. counts={:?}",
+            taint_rule,
+            expected,
+            counts
+        );
+        assert!(
+            counts.get(conservative_rule).copied().unwrap_or(0) >= 1,
+            "conservative {} must coexist with {}. counts={:?}",
+            conservative_rule,
+            taint_rule,
+            counts
+        );
+    }
+}
+
+/// Negative counterpart for the taint POC. Every pickle.loads call in
+/// `safe_py_taint.py` receives a non-tainted argument (static literal,
+/// reassignment kills taint, local variable named `request`, cross-function
+/// taint that the engine intentionally does not track). The taint rule
+/// must not fire at all. NoPickle still fires on every call — that's the
+/// intended division of labor between the conservative and precision
+/// rules.
+#[test]
+fn test_safe_py_taint_has_no_taint_findings() {
+    let output = foxguard_cmd()
+        .args(["tests/fixtures/safe_py_taint.py", "-f", "json"])
+        .output()
+        .expect("failed to execute foxguard");
+
+    let findings: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).expect("invalid JSON output");
+
+    for taint_rule in [
+        "py/taint-pickle-deserialization",
+        "py/taint-eval",
+        "py/taint-command-injection",
+        "py/taint-ssrf",
+        "py/taint-yaml-load",
+        "py/taint-sql-injection",
+    ] {
+        let n = findings
+            .iter()
+            .filter(|f| f["rule_id"].as_str() == Some(taint_rule))
+            .count();
+        assert_eq!(
+            n, 0,
+            "{} should not fire on safe_py_taint.py, got {} findings",
+            taint_rule, n
+        );
+    }
+}
+
+/// Positive Django fixture for issues #29/#30: every handler flows an
+/// untrusted `HttpRequest` attribute into a taint sink via subscript
+/// access. Each taint rule must fire exactly once.
+#[test]
+fn test_vulnerable_django_taint_catches_flows() {
+    let output = foxguard_cmd()
+        .args(["tests/fixtures/vulnerable_django_taint.py", "-f", "json"])
+        .output()
+        .expect("failed to execute foxguard");
+
+    assert!(!output.status.success());
+
+    let findings: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).expect("invalid JSON output");
+
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for f in &findings {
+        if let Some(rule) = f["rule_id"].as_str() {
+            *counts.entry(rule).or_insert(0) += 1;
+        }
+    }
+
+    for rule in [
+        "py/taint-pickle-deserialization",
+        "py/taint-command-injection",
+        "py/taint-eval",
+        "py/taint-yaml-load",
+        "py/taint-ssrf",
+    ] {
+        assert_eq!(
+            counts.get(rule).copied(),
+            Some(1),
+            "{} should fire exactly once on vulnerable_django_taint.py. counts={:?}",
+            rule,
+            counts
+        );
+    }
+}
+
+/// Negative Django fixture for issue #29: every sink gets a trusted
+/// argument, so no `py/taint-*` rule may fire.
+#[test]
+fn test_safe_django_taint_has_no_taint_findings() {
+    let output = foxguard_cmd()
+        .args(["tests/fixtures/safe_django_taint.py", "-f", "json"])
+        .output()
+        .expect("failed to execute foxguard");
+
+    let findings: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).expect("invalid JSON output");
+
+    for taint_rule in [
+        "py/taint-pickle-deserialization",
+        "py/taint-eval",
+        "py/taint-command-injection",
+        "py/taint-ssrf",
+        "py/taint-yaml-load",
+        "py/taint-sql-injection",
+    ] {
+        let n = findings
+            .iter()
+            .filter(|f| f["rule_id"].as_str() == Some(taint_rule))
+            .count();
+        assert_eq!(
+            n, 0,
+            "{} should not fire on safe_django_taint.py, got {} findings",
+            taint_rule, n
+        );
+    }
+}
+
+/// Positive FastAPI/Starlette fixture for issue #29. Covers attribute
+/// sources (`query_params`, `path_params`) and the handler-parameter
+/// name widening that recognizes `req: Request`.
+#[test]
+fn test_vulnerable_fastapi_taint_catches_flows() {
+    let output = foxguard_cmd()
+        .args(["tests/fixtures/vulnerable_fastapi_taint.py", "-f", "json"])
+        .output()
+        .expect("failed to execute foxguard");
+
+    assert!(!output.status.success());
+
+    let findings: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).expect("invalid JSON output");
+
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for f in &findings {
+        if let Some(rule) = f["rule_id"].as_str() {
+            *counts.entry(rule).or_insert(0) += 1;
+        }
+    }
+
+    for rule in [
+        "py/taint-pickle-deserialization",
+        "py/taint-command-injection",
+        "py/taint-eval",
+    ] {
+        assert_eq!(
+            counts.get(rule).copied(),
+            Some(1),
+            "{} should fire exactly once on vulnerable_fastapi_taint.py. counts={:?}",
+            rule,
+            counts
+        );
+    }
+}
+
+/// Negative FastAPI/Starlette fixture for issue #29.
+#[test]
+fn test_safe_fastapi_taint_has_no_taint_findings() {
+    let output = foxguard_cmd()
+        .args(["tests/fixtures/safe_fastapi_taint.py", "-f", "json"])
+        .output()
+        .expect("failed to execute foxguard");
+
+    let findings: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).expect("invalid JSON output");
+
+    for taint_rule in [
+        "py/taint-pickle-deserialization",
+        "py/taint-eval",
+        "py/taint-command-injection",
+        "py/taint-ssrf",
+        "py/taint-yaml-load",
+        "py/taint-sql-injection",
+    ] {
+        let n = findings
+            .iter()
+            .filter(|f| f["rule_id"].as_str() == Some(taint_rule))
+            .count();
+        assert_eq!(
+            n, 0,
+            "{} should not fire on safe_fastapi_taint.py, got {} findings",
+            taint_rule, n
+        );
+    }
+}
+
+/// Positive CLI fixture for issue #30: `sys.argv`, `os.getenv`,
+/// `os.environ[...]`, `input()`, and `sys.stdin.read()` flowing into
+/// command-injection and eval sinks. Expects three
+/// command-injection findings (argv, getenv, environ subscript) and
+/// two eval findings (input, stdin.read).
+#[test]
+fn test_vulnerable_cli_taint_catches_flows() {
+    let output = foxguard_cmd()
+        .args(["tests/fixtures/vulnerable_cli_taint.py", "-f", "json"])
+        .output()
+        .expect("failed to execute foxguard");
+
+    assert!(!output.status.success());
+
+    let findings: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).expect("invalid JSON output");
+
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for f in &findings {
+        if let Some(rule) = f["rule_id"].as_str() {
+            *counts.entry(rule).or_insert(0) += 1;
+        }
+    }
+
+    assert_eq!(
+        counts.get("py/taint-command-injection").copied(),
+        Some(3),
+        "py/taint-command-injection should fire three times on vulnerable_cli_taint.py. counts={:?}",
+        counts
+    );
+    assert_eq!(
+        counts.get("py/taint-eval").copied(),
+        Some(2),
+        "py/taint-eval should fire twice on vulnerable_cli_taint.py. counts={:?}",
+        counts
+    );
+}
+
+/// Negative CLI fixture for issue #30.
+#[test]
+fn test_safe_cli_taint_has_no_taint_findings() {
+    let output = foxguard_cmd()
+        .args(["tests/fixtures/safe_cli_taint.py", "-f", "json"])
+        .output()
+        .expect("failed to execute foxguard");
+
+    let findings: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).expect("invalid JSON output");
+
+    for taint_rule in [
+        "py/taint-pickle-deserialization",
+        "py/taint-eval",
+        "py/taint-command-injection",
+        "py/taint-ssrf",
+        "py/taint-yaml-load",
+        "py/taint-sql-injection",
+    ] {
+        let n = findings
+            .iter()
+            .filter(|f| f["rule_id"].as_str() == Some(taint_rule))
+            .count();
+        assert_eq!(
+            n, 0,
+            "{} should not fire on safe_cli_taint.py, got {} findings",
+            taint_rule, n
+        );
+    }
+}
+
+/// POC for issue #18 intraprocedural JS/TS taint tracking. Every handler
+/// in `vulnerable_js_taint.js` shows a different shape of untrusted
+/// Express input reaching an innerHTML/document.write sink. The taint
+/// rule must catch each flow, and the existing conservative
+/// `js/no-xss-innerhtml` / `js/no-document-write` rules must keep firing
+/// alongside it (the two rule classes coexist by design).
+#[test]
+fn test_vulnerable_js_taint_catches_every_flow() {
+    let output = foxguard_cmd()
+        .args(["tests/fixtures/vulnerable_js_taint.js", "-f", "json"])
+        .output()
+        .expect("failed to execute foxguard");
+
+    assert!(!output.status.success());
+
+    let findings: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).expect("invalid JSON output");
+
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for f in &findings {
+        if let Some(rule) = f["rule_id"].as_str() {
+            *counts.entry(rule).or_insert(0) += 1;
+        }
+    }
+
+    // Nine handlers, each with exactly one source→sink flow (six
+    // original + two added by #19 for same-file interprocedural return
+    // propagation + one added by #27 for method-call propagation on a
+    // tainted root `req.body.toString()`).
+    assert_eq!(
+        counts.get("js/taint-xss-innerhtml").copied(),
+        Some(9),
+        "js/taint-xss-innerhtml should fire exactly nine times. counts={:?}",
+        counts
+    );
+    // The conservative rules must still coexist on the same fixture.
+    assert!(
+        counts.get("js/no-xss-innerhtml").copied().unwrap_or(0) >= 1,
+        "js/no-xss-innerhtml must coexist with the taint rule. counts={:?}",
+        counts
+    );
+    assert!(
+        counts.get("js/no-document-write").copied().unwrap_or(0) >= 1,
+        "js/no-document-write must coexist with the taint rule. counts={:?}",
+        counts
+    );
+}
+
+/// Negative counterpart for the JS/TS taint POC. Every innerHTML/
+/// document.write sink call here receives a non-tainted argument (static
+/// literal, reassignment kills taint, local variable named `request`,
+/// cross-function taint the engine intentionally does not track). The
+/// taint rule must not fire at all.
+#[test]
+fn test_safe_js_taint_has_no_taint_findings() {
+    let output = foxguard_cmd()
+        .args(["tests/fixtures/safe_js_taint.js", "-f", "json"])
+        .output()
+        .expect("failed to execute foxguard");
+
+    let findings: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).expect("invalid JSON output");
+
+    let n = findings
+        .iter()
+        .filter(|f| f["rule_id"].as_str() == Some("js/taint-xss-innerhtml"))
+        .count();
+    assert_eq!(
+        n, 0,
+        "js/taint-xss-innerhtml should not fire on safe_js_taint.js, got {} findings",
+        n
+    );
+}
+
+/// Issue #32 — Next.js App Router taint sources. `request` is the
+/// ParamName-seeded handler input and `request.nextUrl` is a Next.js
+/// specific Attribute source. Both handlers must fire exactly once.
+#[test]
+fn test_vulnerable_nextjs_taint_catches_flow() {
+    let output = foxguard_cmd()
+        .args(["tests/fixtures/vulnerable_nextjs_taint.ts", "-f", "json"])
+        .output()
+        .expect("failed to execute foxguard");
+
+    assert!(!output.status.success());
+
+    let findings: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).expect("invalid JSON output");
+
+    let n = findings
+        .iter()
+        .filter(|f| f["rule_id"].as_str() == Some("js/taint-xss-innerhtml"))
+        .count();
+    assert_eq!(
+        n, 2,
+        "js/taint-xss-innerhtml should fire exactly twice on vulnerable_nextjs_taint.ts, got {} findings: {:?}",
+        n, findings
+    );
+}
+
+#[test]
+fn test_safe_nextjs_taint_has_no_taint_findings() {
+    let output = foxguard_cmd()
+        .args(["tests/fixtures/safe_nextjs_taint.ts", "-f", "json"])
+        .output()
+        .expect("failed to execute foxguard");
+
+    let findings: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).expect("invalid JSON output");
+
+    let n = findings
+        .iter()
+        .filter(|f| f["rule_id"].as_str() == Some("js/taint-xss-innerhtml"))
+        .count();
+    assert_eq!(
+        n, 0,
+        "js/taint-xss-innerhtml should not fire on safe_nextjs_taint.ts, got {} findings",
+        n
+    );
+}
+
+/// Issue #32 — Hono taint sources. `c` is intentionally NOT a ParamName
+/// matcher; the engine must pick up `c.req.query(...)` / `c.req.param(...)`
+/// through the explicit `Call` matchers.
+#[test]
+fn test_vulnerable_hono_taint_catches_flow() {
+    let output = foxguard_cmd()
+        .args(["tests/fixtures/vulnerable_hono_taint.ts", "-f", "json"])
+        .output()
+        .expect("failed to execute foxguard");
+
+    assert!(!output.status.success());
+
+    let findings: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).expect("invalid JSON output");
+
+    let n = findings
+        .iter()
+        .filter(|f| f["rule_id"].as_str() == Some("js/taint-xss-innerhtml"))
+        .count();
+    assert_eq!(
+        n, 2,
+        "js/taint-xss-innerhtml should fire exactly twice on vulnerable_hono_taint.ts, got {} findings: {:?}",
+        n, findings
+    );
+}
+
+#[test]
+fn test_safe_hono_taint_has_no_taint_findings() {
+    let output = foxguard_cmd()
+        .args(["tests/fixtures/safe_hono_taint.ts", "-f", "json"])
+        .output()
+        .expect("failed to execute foxguard");
+
+    let findings: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).expect("invalid JSON output");
+
+    let n = findings
+        .iter()
+        .filter(|f| f["rule_id"].as_str() == Some("js/taint-xss-innerhtml"))
+        .count();
+    assert_eq!(
+        n, 0,
+        "js/taint-xss-innerhtml should not fire on safe_hono_taint.ts, got {} findings",
+        n
+    );
+}
+
+/// Issue #32 — Deno taint sources. `Deno.args` is an Attribute source,
+/// `Deno.env.get(...)` is a Call source. The engine only analyzes
+/// function bodies, so the fixture wraps its sinks accordingly.
+#[test]
+fn test_vulnerable_deno_taint_catches_flow() {
+    let output = foxguard_cmd()
+        .args(["tests/fixtures/vulnerable_deno_taint.ts", "-f", "json"])
+        .output()
+        .expect("failed to execute foxguard");
+
+    assert!(!output.status.success());
+
+    let findings: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).expect("invalid JSON output");
+
+    let n = findings
+        .iter()
+        .filter(|f| f["rule_id"].as_str() == Some("js/taint-xss-innerhtml"))
+        .count();
+    assert_eq!(
+        n, 2,
+        "js/taint-xss-innerhtml should fire exactly twice on vulnerable_deno_taint.ts, got {} findings: {:?}",
+        n, findings
+    );
+}
+
+#[test]
+fn test_safe_deno_taint_has_no_taint_findings() {
+    let output = foxguard_cmd()
+        .args(["tests/fixtures/safe_deno_taint.ts", "-f", "json"])
+        .output()
+        .expect("failed to execute foxguard");
+
+    let findings: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).expect("invalid JSON output");
+
+    let n = findings
+        .iter()
+        .filter(|f| f["rule_id"].as_str() == Some("js/taint-xss-innerhtml"))
+        .count();
+    assert_eq!(
+        n, 0,
+        "js/taint-xss-innerhtml should not fire on safe_deno_taint.ts, got {} findings",
+        n
+    );
+}
+
+/// Negative regression for issue #7: aliased imports of the *same* sensitive
+/// modules, but called in safe shapes (static literals, SafeLoader, sha256,
+/// write-only pickle methods). Alias resolution must not silently widen the
+/// match surface — this file should still produce zero findings.
+#[test]
+fn test_safe_py_aliases_no_findings() {
+    let output = foxguard_cmd()
+        .args(["tests/fixtures/safe_py_aliases.py", "-f", "json"])
+        .output()
+        .expect("failed to execute foxguard");
+
+    assert!(
+        output.status.success(),
+        "safe_py_aliases.py should exit zero"
+    );
+
+    let findings: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).expect("invalid JSON output");
+
+    assert_eq!(
+        findings.len(),
+        0,
+        "safe_py_aliases.py should have 0 findings, got {:?}",
+        findings
+    );
 }
 
 #[test]
@@ -764,6 +1380,138 @@ fn test_scan_uses_discovered_config_baseline() {
         findings.len(),
         0,
         "expected no findings after config baseline"
+    );
+}
+
+#[test]
+fn test_inline_ignore_suppresses_same_line_js_finding() {
+    let repo = TempDir::new().expect("failed to create temp dir");
+    let target = repo.path().join("ignored.js");
+    fs::write(
+        &target,
+        "const user_input = process.argv[2];\neval(user_input); // foxguard: ignore[js/no-eval]\n",
+    )
+    .expect("failed to write fixture");
+
+    let output = foxguard_cmd()
+        .args([target.to_str().expect("non-utf8 path"), "-f", "json"])
+        .output()
+        .expect("failed to execute foxguard");
+
+    assert!(
+        output.status.success(),
+        "same-line ignore should suppress the matching finding"
+    );
+
+    let findings: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).expect("invalid JSON output");
+    assert!(
+        findings.is_empty(),
+        "expected no findings after same-line ignore"
+    );
+}
+
+#[test]
+fn test_inline_ignore_suppresses_next_python_line_after_blank_lines() {
+    let repo = TempDir::new().expect("failed to create temp dir");
+    let target = repo.path().join("ignored.py");
+    fs::write(&target, "# foxguard: ignore[py/no-eval]\n\neval(input())\n")
+        .expect("failed to write fixture");
+
+    let output = foxguard_cmd()
+        .args([target.to_str().expect("non-utf8 path"), "-f", "json"])
+        .output()
+        .expect("failed to execute foxguard");
+
+    assert!(
+        output.status.success(),
+        "comment-only ignore should suppress the next code-line finding"
+    );
+
+    let findings: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).expect("invalid JSON output");
+    assert!(
+        findings.is_empty(),
+        "expected no findings after next-line ignore"
+    );
+}
+
+#[test]
+fn test_inline_ignore_remains_rule_specific() {
+    let repo = TempDir::new().expect("failed to create temp dir");
+    let target = repo.path().join("not-ignored.js");
+    fs::write(
+        &target,
+        "const user_input = process.argv[2];\neval(user_input); // foxguard: ignore[js/no-sql-injection]\n",
+    )
+    .expect("failed to write fixture");
+
+    let output = foxguard_cmd()
+        .args([target.to_str().expect("non-utf8 path"), "-f", "json"])
+        .output()
+        .expect("failed to execute foxguard");
+
+    assert!(
+        !output.status.success(),
+        "mismatched rule ID should not suppress the finding"
+    );
+
+    let findings: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).expect("invalid JSON output");
+    assert_eq!(findings.len(), 1, "expected the finding to remain");
+    assert_eq!(findings[0]["rule_id"], "js/no-eval");
+}
+
+#[test]
+fn test_inline_ignore_without_rule_list_suppresses_all_findings_on_line() {
+    let repo = TempDir::new().expect("failed to create temp dir");
+    let target = repo.path().join("ignored-all.js");
+    fs::write(
+        &target,
+        "const user_input = process.argv[2];\neval(user_input); // foxguard: ignore\n",
+    )
+    .expect("failed to write fixture");
+
+    let output = foxguard_cmd()
+        .args([target.to_str().expect("non-utf8 path"), "-f", "json"])
+        .output()
+        .expect("failed to execute foxguard");
+
+    assert!(
+        output.status.success(),
+        "ignore without rule list should suppress all findings on the line"
+    );
+
+    let findings: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).expect("invalid JSON output");
+    assert!(findings.is_empty(), "expected no findings after ignore-all");
+}
+
+#[test]
+fn test_inline_ignore_suppresses_multiline_finding_when_directive_is_on_end_line() {
+    let repo = TempDir::new().expect("failed to create temp dir");
+    let target = repo.path().join("multiline-ignored.js");
+    fs::write(
+        &target,
+        "const user_input = process.argv[2];\neval(\n  user_input // foxguard: ignore[js/no-eval]\n);\n",
+    )
+    .expect("failed to write fixture");
+
+    let output = foxguard_cmd()
+        .args([target.to_str().expect("non-utf8 path"), "-f", "json"])
+        .output()
+        .expect("failed to execute foxguard");
+
+    assert!(
+        output.status.success(),
+        "directive on the end line of a multiline finding should still suppress it"
+    );
+
+    let findings: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).expect("invalid JSON output");
+    assert!(
+        findings.is_empty(),
+        "expected no findings after multiline inline ignore"
     );
 }
 
@@ -1343,4 +2091,266 @@ fn test_sarif_output_valid() {
         .as_array()
         .expect("missing results array");
     assert!(!results.is_empty(), "SARIF results should not be empty");
+}
+
+/// Semgrep-compatible `mode: taint` YAML rules should load via `--rules`
+/// and fire on the same flows as the native `py/taint-pickle-deserialization`
+/// rule. See issue #17.
+#[test]
+fn test_semgrep_taint_yaml_bridge_vulnerable() {
+    let output = foxguard_cmd()
+        .args([
+            "tests/fixtures/vulnerable_py_taint.py",
+            "-f",
+            "json",
+            "--no-builtins",
+            "--rules",
+            "tests/fixtures/semgrep_taint/pickle_taint.yml",
+        ])
+        .output()
+        .expect("failed to execute foxguard");
+
+    let findings: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).expect("invalid JSON output");
+
+    let lines: Vec<u64> = findings
+        .iter()
+        .filter(|f| f["rule_id"].as_str() == Some("semgrep/semgrep-pickle-taint"))
+        .filter_map(|f| f["line"].as_u64())
+        .collect();
+
+    assert!(
+        !lines.is_empty(),
+        "semgrep taint rule should fire at least once on vulnerable_py_taint.py, got: {:?}",
+        findings
+    );
+
+    // Every pickle handler in the fixture (16 flows, matching the native
+    // py/taint-pickle-deserialization rule) should be caught by the YAML
+    // bridge. Asserting the exact count keeps the bridge honest: regressions
+    // in pattern translation or the taint engine will flip this number.
+    assert_eq!(
+        lines.len(),
+        16,
+        "semgrep taint rule should fire on all 16 pickle flows, got {} (lines: {:?})",
+        lines.len(),
+        lines
+    );
+}
+
+#[test]
+fn test_semgrep_taint_yaml_bridge_safe() {
+    let output = foxguard_cmd()
+        .args([
+            "tests/fixtures/safe_py_taint.py",
+            "-f",
+            "json",
+            "--no-builtins",
+            "--rules",
+            "tests/fixtures/semgrep_taint/pickle_taint.yml",
+        ])
+        .output()
+        .expect("failed to execute foxguard");
+
+    let findings: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).expect("invalid JSON output");
+
+    let n = findings
+        .iter()
+        .filter(|f| f["rule_id"].as_str() == Some("semgrep/semgrep-pickle-taint"))
+        .count();
+
+    assert_eq!(
+        n, 0,
+        "semgrep taint rule should not fire on safe_py_taint.py, got {} findings",
+        n
+    );
+}
+
+/// The Semgrep taint bridge must accept `pattern-either:` blocks inside
+/// `pattern-sources` / `pattern-sinks` (issue #33). The
+/// `pickle_taint_either.yml` fixture expresses the same sources and sinks
+/// as `pickle_taint.yml`, just using `pattern-either:` to group them, and
+/// must produce the same 16 findings on `vulnerable_py_taint.py`.
+#[test]
+fn test_semgrep_taint_yaml_bridge_pattern_either_vulnerable() {
+    let output = foxguard_cmd()
+        .args([
+            "tests/fixtures/vulnerable_py_taint.py",
+            "-f",
+            "json",
+            "--no-builtins",
+            "--rules",
+            "tests/fixtures/semgrep_taint/pickle_taint_either.yml",
+        ])
+        .output()
+        .expect("failed to execute foxguard");
+
+    let findings: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).expect("invalid JSON output");
+
+    let lines: Vec<u64> = findings
+        .iter()
+        .filter(|f| f["rule_id"].as_str() == Some("semgrep/semgrep-pickle-taint-either"))
+        .filter_map(|f| f["line"].as_u64())
+        .collect();
+
+    assert_eq!(
+        lines.len(),
+        16,
+        "semgrep pattern-either taint rule should fire on all 16 pickle flows, got {} (lines: {:?})",
+        lines.len(),
+        lines
+    );
+}
+
+#[test]
+fn test_semgrep_taint_yaml_bridge_pattern_either_safe() {
+    let output = foxguard_cmd()
+        .args([
+            "tests/fixtures/safe_py_taint.py",
+            "-f",
+            "json",
+            "--no-builtins",
+            "--rules",
+            "tests/fixtures/semgrep_taint/pickle_taint_either.yml",
+        ])
+        .output()
+        .expect("failed to execute foxguard");
+
+    let findings: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).expect("invalid JSON output");
+
+    let n = findings
+        .iter()
+        .filter(|f| f["rule_id"].as_str() == Some("semgrep/semgrep-pickle-taint-either"))
+        .count();
+
+    assert_eq!(
+        n, 0,
+        "semgrep pattern-either taint rule should not fire on safe_py_taint.py, got {} findings",
+        n
+    );
+}
+
+// ─── Go taint engine (issue #31) ───────────────────────────────────────────
+
+/// Positive fixture for the Go taint engine: each handler flows an
+/// untrusted source (Gin/net/http/Echo/Fiber/env) into a
+/// command-injection, SQL-injection, or SSRF sink. Each go/taint-*
+/// rule must fire the expected number of times and its conservative
+/// go/no-* counterpart must coexist.
+#[test]
+fn test_vulnerable_go_taint_catches_every_flow() {
+    let output = foxguard_cmd()
+        .args(["tests/fixtures/vulnerable_go_taint.go", "-f", "json"])
+        .output()
+        .expect("failed to execute foxguard");
+
+    assert!(!output.status.success());
+
+    let findings: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).expect("invalid JSON output");
+
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for f in &findings {
+        if let Some(rule) = f["rule_id"].as_str() {
+            *counts.entry(rule).or_insert(0) += 1;
+        }
+    }
+
+    // Five command-injection handlers, three SQL, three SSRF.
+    for (taint_rule, conservative_rule, expected) in [
+        (
+            "go/taint-command-injection",
+            "go/no-command-injection",
+            5usize,
+        ),
+        ("go/taint-sql-injection", "go/no-sql-injection", 3),
+        ("go/taint-ssrf", "go/no-ssrf", 3),
+    ] {
+        assert_eq!(
+            counts.get(taint_rule).copied(),
+            Some(expected),
+            "{} should fire exactly {} time(s) on vulnerable_go_taint.go. counts={:?}",
+            taint_rule,
+            expected,
+            counts
+        );
+        assert!(
+            counts.get(conservative_rule).copied().unwrap_or(0) >= 1,
+            "conservative {} must coexist with {}. counts={:?}",
+            conservative_rule,
+            taint_rule,
+            counts
+        );
+    }
+}
+
+/// Negative counterpart for the Go taint engine. Every handler in
+/// `safe_go_taint.go` either uses a literal argument, has its
+/// taint killed by reassignment, or relies on cross-function
+/// isolation. No go/taint-* rule may fire.
+#[test]
+fn test_safe_go_taint_has_no_taint_findings() {
+    let output = foxguard_cmd()
+        .args(["tests/fixtures/safe_go_taint.go", "-f", "json"])
+        .output()
+        .expect("failed to execute foxguard");
+
+    let findings: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).expect("invalid JSON output");
+
+    for taint_rule in [
+        "go/taint-command-injection",
+        "go/taint-sql-injection",
+        "go/taint-ssrf",
+    ] {
+        let n = findings
+            .iter()
+            .filter(|f| f["rule_id"].as_str() == Some(taint_rule))
+            .count();
+        assert_eq!(
+            n, 0,
+            "{} should not fire on safe_go_taint.go, got {} findings",
+            taint_rule, n
+        );
+    }
+}
+
+/// End-to-end validation: a small realistic Gin service with three
+/// planted vulnerabilities (command injection, SQL injection, SSRF)
+/// must produce exactly one finding per go/taint-* rule.
+#[test]
+fn test_realistic_gin_app_findings() {
+    let output = foxguard_cmd()
+        .args(["tests/fixtures/realistic/gin_app.go", "-f", "json"])
+        .output()
+        .expect("failed to execute foxguard");
+
+    assert!(!output.status.success());
+
+    let findings: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).expect("invalid JSON output");
+
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for f in &findings {
+        if let Some(rule) = f["rule_id"].as_str() {
+            *counts.entry(rule).or_insert(0) += 1;
+        }
+    }
+
+    for rule in [
+        "go/taint-command-injection",
+        "go/taint-sql-injection",
+        "go/taint-ssrf",
+    ] {
+        assert_eq!(
+            counts.get(rule).copied(),
+            Some(1),
+            "{} should fire exactly once on realistic/gin_app.go. counts={:?}",
+            rule,
+            counts
+        );
+    }
 }

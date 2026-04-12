@@ -1,53 +1,8 @@
-use crate::rules::Rule;
+use crate::rules::common::{get_source_line, make_finding, walk_tree};
+use crate::rules::{FileContext, Rule};
 use crate::{Finding, Language, Severity};
 #[allow(unused_imports)]
 use regex::Regex;
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-fn get_source_line(source: &str, byte_offset: usize) -> String {
-    let start = source[..byte_offset].rfind('\n').map_or(0, |p| p + 1);
-    let end = source[byte_offset..]
-        .find('\n')
-        .map_or(source.len(), |p| byte_offset + p);
-    source[start..end].to_string()
-}
-
-fn walk_tree(
-    node: tree_sitter::Node,
-    source: &str,
-    callback: &mut dyn FnMut(tree_sitter::Node, &str),
-) {
-    callback(node, source);
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        walk_tree(child, source, callback);
-    }
-}
-
-fn make_finding(
-    rule_id: &str,
-    severity: Severity,
-    cwe: Option<&str>,
-    description: &str,
-    node: tree_sitter::Node,
-    source: &str,
-) -> Finding {
-    let start = node.start_position();
-    let end = node.end_position();
-    Finding {
-        rule_id: rule_id.to_string(),
-        severity,
-        cwe: cwe.map(|s| s.to_string()),
-        description: description.to_string(),
-        file: String::new(), // filled in by scanner
-        line: start.row + 1,
-        column: start.column + 1,
-        end_line: end.row + 1,
-        end_column: end.column + 1,
-        snippet: get_source_line(source, node.start_byte()),
-    }
-}
 
 // ─── Rule 1: no-eval ─────────────────────────────────────────────────────────
 
@@ -1822,5 +1777,181 @@ impl Rule for NoUnsafeFormatString {
             }
         });
         findings
+    }
+}
+
+// ─── js/taint-xss-innerhtml ───────────────────────────────────────────────
+//
+// Intraprocedural taint rule: fires when untrusted Express-style input
+// (`req.body`, `req.query`, ...) reaches an `innerHTML`/`outerHTML`
+// assignment or a `document.write` call. Uses the engine in
+// `javascript_taint` the same way `python::TaintPickleDeserialization`
+// uses `python_taint`.
+
+use crate::rules::javascript_taint::{
+    self, javascript_taint_sources, NodeMatcher as JsNodeMatcher, TaintSpec as JsTaintSpec,
+};
+
+pub struct TaintXssInnerHtml;
+
+impl TaintXssInnerHtml {
+    fn spec() -> JsTaintSpec {
+        JsTaintSpec {
+            sources: javascript_taint_sources(),
+            sinks: vec![
+                JsNodeMatcher::MemberAssign {
+                    field: "innerHTML".into(),
+                    description: "innerHTML assignment".into(),
+                },
+                JsNodeMatcher::MemberAssign {
+                    field: "outerHTML".into(),
+                    description: "outerHTML assignment".into(),
+                },
+                JsNodeMatcher::Call {
+                    canonical: "document.write".into(),
+                    description: "document.write".into(),
+                },
+                JsNodeMatcher::Call {
+                    canonical: "document.writeln".into(),
+                    description: "document.writeln".into(),
+                },
+            ],
+            sanitizers: vec![],
+        }
+    }
+}
+
+impl Rule for TaintXssInnerHtml {
+    fn id(&self) -> &str {
+        "js/taint-xss-innerhtml"
+    }
+    fn severity(&self) -> Severity {
+        Severity::High
+    }
+    fn cwe(&self) -> Option<&str> {
+        Some("CWE-79")
+    }
+    fn description(&self) -> &str {
+        "Untrusted input reaches innerHTML or document.write sink"
+    }
+    fn language(&self) -> Language {
+        Language::JavaScript
+    }
+
+    fn check(&self, source: &str, tree: &tree_sitter::Tree) -> Vec<Finding> {
+        self.check_with_context(source, tree, &FileContext::default())
+    }
+
+    fn check_with_context(
+        &self,
+        source: &str,
+        tree: &tree_sitter::Tree,
+        ctx: &FileContext<'_>,
+    ) -> Vec<Finding> {
+        let spec = Self::spec();
+        let raw =
+            javascript_taint::analyze_tree(tree.root_node(), source, &spec, ctx.javascript_aliases);
+        raw.into_iter()
+            .map(|t| Finding {
+                rule_id: self.id().to_string(),
+                severity: self.severity(),
+                cwe: self.cwe().map(|s| s.to_string()),
+                description: format!(
+                    "{} reaches {} — untrusted input can lead to XSS",
+                    t.source_description, t.sink_description
+                ),
+                file: String::new(),
+                line: t.sink_line,
+                column: t.sink_column,
+                end_line: t.sink_end_line,
+                end_column: t.sink_end_column,
+                snippet: get_source_line(source, t.sink_start_byte),
+            })
+            .collect()
+    }
+}
+
+// ─── js/taint-sql-injection ───────────────────────────────────────────────
+//
+// Intraprocedural taint rule: fires when untrusted Express/Next/etc input
+// (`req.body`, `req.query`, `searchParams.get(...)`, ...) reaches a SQL
+// execute sink. Sinks are identified by method name on any receiver,
+// matching the common JS SQL client conventions (`db.query`, `pool.query`,
+// `connection.execute`, `sequelize.query`, `knex.raw`). This is noisier
+// than the canonical-callee approach but catches the realistic shape of
+// server-side JS apps where database handles are ad-hoc variables.
+
+pub struct TaintSqlInjection;
+
+impl TaintSqlInjection {
+    fn spec() -> JsTaintSpec {
+        JsTaintSpec {
+            sources: javascript_taint_sources(),
+            sinks: vec![
+                JsNodeMatcher::MethodName {
+                    method: "query".into(),
+                    description: "SQL .query() call".into(),
+                },
+                JsNodeMatcher::MethodName {
+                    method: "execute".into(),
+                    description: "SQL .execute() call".into(),
+                },
+                JsNodeMatcher::MethodName {
+                    method: "raw".into(),
+                    description: "SQL .raw() call (knex-style)".into(),
+                },
+            ],
+            sanitizers: vec![],
+        }
+    }
+}
+
+impl Rule for TaintSqlInjection {
+    fn id(&self) -> &str {
+        "js/taint-sql-injection"
+    }
+    fn severity(&self) -> Severity {
+        Severity::Critical
+    }
+    fn cwe(&self) -> Option<&str> {
+        Some("CWE-89")
+    }
+    fn description(&self) -> &str {
+        "Untrusted input reaches a SQL execute sink — possible SQL injection"
+    }
+    fn language(&self) -> Language {
+        Language::JavaScript
+    }
+
+    fn check(&self, source: &str, tree: &tree_sitter::Tree) -> Vec<Finding> {
+        self.check_with_context(source, tree, &FileContext::default())
+    }
+
+    fn check_with_context(
+        &self,
+        source: &str,
+        tree: &tree_sitter::Tree,
+        ctx: &FileContext<'_>,
+    ) -> Vec<Finding> {
+        let spec = Self::spec();
+        let raw =
+            javascript_taint::analyze_tree(tree.root_node(), source, &spec, ctx.javascript_aliases);
+        raw.into_iter()
+            .map(|t| Finding {
+                rule_id: self.id().to_string(),
+                severity: self.severity(),
+                cwe: self.cwe().map(|s| s.to_string()),
+                description: format!(
+                    "{} reaches {} — untrusted input can inject SQL",
+                    t.source_description, t.sink_description
+                ),
+                file: String::new(),
+                line: t.sink_line,
+                column: t.sink_column,
+                end_line: t.sink_end_line,
+                end_column: t.sink_end_column,
+                snippet: get_source_line(source, t.sink_start_byte),
+            })
+            .collect()
     }
 }
